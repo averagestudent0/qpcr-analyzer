@@ -1,22 +1,17 @@
 """
 process_gene_expression.py
 ---------------------------
-Core qPCR analysis logic. All functions are pure / side-effect-free:
-they accept workbook / worksheet objects and return results or mutate
-the worksheet in place. No file I/O happens here — the Streamlit app
-handles reading and writing.
+Core qPCR analysis logic — pure Python, no LibreOffice dependency.
 
-Spreadsheet format expected (per organ block):
-  Header row  : [blank] [blank] <HK_gene>  <test_gene>  (cols A–D, row label in E is "delta" if pre-existing)
-  Data rows   : [organ] <label> <HK_val>   <test_val>
-  ...more replicates (col A blank, col B can be blank or "cont…")
-  [blank row] → end of block, next block starts
+Spreadsheet format (per organ block):
+  Optional text header row: col A = organ name, col C = HK gene name, col D = test gene name
+  Data rows: col B = sample label, col C = HK value (float), col D = test value (float)
+  Blocks separated by blank rows (no numeric C+D).
 
 Control vs drug grouping:
-  The FIRST named group per organ block is the control.
-  A "cont" (case-insensitive) or blank col-B row is a replicate of the
-  current group — it does NOT start a new group.
-  Every subsequent named group is a drug / treatment group.
+  First named group per block = control.
+  Row whose col B is blank / starts with "cont" = replicate of current group.
+  Every subsequent named group = drug / treatment.
 """
 
 import io
@@ -29,235 +24,384 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+COL_ORGAN = 1   # A
+COL_LABEL = 2   # B
+COL_HK    = 3   # C
+COL_TEST  = 4   # D
+COL_DELTA = 5   # E
+COL_REL   = 6   # F
 
-# ── Column indices (1-based) ──────────────────────────────────────────────────
-COL_ORGAN   = 1   # A
-COL_LABEL   = 2   # B
-COL_HK      = 3   # C  housekeeping gene
-COL_TEST    = 4   # D  gene of interest
-COL_DELTA   = 5   # E  written by this script
-COL_REL     = 6   # F  written by this script
-
-# ── Style constants ───────────────────────────────────────────────────────────
-CTRL_HEX   = "D9D9D9"
-DRUG_HEX   = "F4A99A"
-HDR_HEX    = "2F4F8F"
-CTRL_MPL   = "#C8C8C8"
-DRUG_MPL   = "#E04030"
+CTRL_HEX = "D9D9D9"
+DRUG_HEX = "F4A99A"
+HDR_HEX  = "2F4F8F"
+CTRL_MPL = "#C8C8C8"
+DRUG_MPL = "#E04030"
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def cl(n):
+    return get_column_letter(n)
 
-def cl(col_index: int) -> str:
-    return get_column_letter(col_index)
+def is_numeric(v):
+    try:
+        float(v)
+        return True
+    except (TypeError, ValueError):
+        return False
 
-
-def is_continuation(label) -> bool:
-    """True if col-B value means 'another replicate of the current group'."""
+def is_continuation(label):
     if label is None:
         return True
     s = str(label).strip().lower()
     return s == "" or s.startswith("cont")
 
 
-# ── Block parser ──────────────────────────────────────────────────────────────
+# ── Parser ────────────────────────────────────────────────────────────────────
 
-def parse_blocks(ws) -> list[dict]:
+def parse_blocks(ws) -> list:
     """
-    Scan the worksheet and return one dict per organ block:
+    Return one dict per organ block:
     {
-        organ       : str
-        header_row  : int   (1-based row that will hold the delta/avg header)
-        ctrl_rows   : [int]
-        ctrl_label  : str
-        drug_rows   : [int]
-        drug_labels : [str]
-        hk_name     : str   (col C header if present, else None)
-        test_name   : str   (col D header if present, else None)
+        organ, hk_name, test_name,
+        header_row (the text/label row just above first data row, or None),
+        first_data_row, last_data_row,
+        ctrl_rows, ctrl_label,
+        drug_rows, drug_labels,
     }
-
-    A "header row" is the row immediately BEFORE the first data row of a block.
-    If the original sheet already has a header row (col E == "delta"), we reuse it.
-    Otherwise we insert one.
     """
-    blocks = []
-    max_row = ws.max_row
+    blocks     = []
+    max_row    = ws.max_row
 
-    # Identify existing header rows (col E == "delta")
-    header_row_set: set[int] = set()
+    # Identify every row that has numeric values in both C and D
+    numeric_rows = set()
     for r in range(1, max_row + 1):
-        v = ws.cell(row=r, column=COL_DELTA).value
-        if isinstance(v, str) and v.strip().lower() == "delta":
-            header_row_set.add(r)
+        if is_numeric(ws.cell(row=r, column=COL_HK).value) and \
+           is_numeric(ws.cell(row=r, column=COL_TEST).value):
+            numeric_rows.add(r)
 
-    # Walk rows looking for data blocks
+    visited = set()
     r = 1
     while r <= max_row:
-        a = ws.cell(row=r, column=COL_ORGAN).value
-        b = ws.cell(row=r, column=COL_LABEL).value
-        c = ws.cell(row=r, column=COL_HK).value
-        d = ws.cell(row=r, column=COL_TEST).value
-
-        # Skip rows that are header rows or fully blank
-        if r in header_row_set or (a is None and b is None and c is None and d is None):
+        if r not in numeric_rows or r in visited:
             r += 1
             continue
 
-        # A row with numeric data in C and D starts or continues a block
-        if c is not None and d is not None:
-            # --- start of a new block ---
-            organ        = None
-            groups       = []          # [{"name": str, "rows": [int]}]
-            current_grp  = None
-            hk_name      = None
-            test_name    = None
+        # ── find the contiguous block of numeric rows starting at r ──
+        block_start = r
+        block_end   = r
+        while block_end + 1 in numeric_rows:
+            block_end += 1
 
-            # Determine header row: the row just before this one
-            # (either an existing header row or we'll insert one later)
-            candidate_header = r - 1
-            if candidate_header in header_row_set:
-                header_row = candidate_header
-                hk_name   = ws.cell(row=header_row, column=COL_HK).value
-                test_name = ws.cell(row=header_row, column=COL_TEST).value
-            else:
-                # No pre-existing header — we'll insert one
-                header_row = None   # signal to caller to insert
+        for rr in range(block_start, block_end + 1):
+            visited.add(rr)
 
-            # Scan data rows of this block
-            rr = r
-            while rr <= max_row:
-                av = ws.cell(row=rr, column=COL_ORGAN).value
-                bv = ws.cell(row=rr, column=COL_LABEL).value
-                cv = ws.cell(row=rr, column=COL_HK).value
-                dv = ws.cell(row=rr, column=COL_TEST).value
+        # ── look for organ name / column headers in the row(s) above ──
+        organ     = None
+        hk_name   = None
+        test_name = None
 
-                # Blank row or another header row → end of block
-                if (av is None and bv is None and cv is None and dv is None) or \
-                   rr in header_row_set and rr != r:
+        for look in range(block_start - 1, max(0, block_start - 4), -1):
+            a = ws.cell(row=look, column=COL_ORGAN).value
+            c = ws.cell(row=look, column=COL_HK).value
+            d = ws.cell(row=look, column=COL_TEST).value
+            if a is not None and str(a).strip():
+                organ = str(a).strip()
+            if isinstance(c, str) and c.strip():
+                hk_name = c.strip()
+            if isinstance(d, str) and d.strip():
+                test_name = d.strip()
+            if organ:
+                break
+
+        # Also check col A within the data rows themselves
+        if organ is None:
+            for rr in range(block_start, block_end + 1):
+                a = ws.cell(row=rr, column=COL_ORGAN).value
+                if a is not None and str(a).strip():
+                    organ = str(a).strip()
                     break
 
-                if av is not None:
-                    organ = str(av).strip()
+        if organ is None:
+            organ = f"Block_{block_start}"
 
-                if cv is not None:  # has HK data → data row
-                    if is_continuation(bv):
-                        if current_grp is not None:
-                            current_grp["rows"].append(rr)
-                    else:
-                        current_grp = {"name": str(bv).strip(), "rows": [rr]}
-                        groups.append(current_grp)
+        # ── group data rows by sample ──
+        groups      = []
+        current_grp = None
 
-                rr += 1
+        for rr in range(block_start, block_end + 1):
+            bv = ws.cell(row=rr, column=COL_LABEL).value
+            if is_continuation(bv):
+                if current_grp is not None:
+                    current_grp["rows"].append(rr)
+            else:
+                current_grp = {"name": str(bv).strip(), "rows": [rr]}
+                groups.append(current_grp)
 
-            if organ and groups:
-                ctrl_rows   = groups[0]["rows"]
-                ctrl_label  = groups[0]["name"]
-                drug_rows   = []
-                drug_labels = []
-                for g in groups[1:]:
-                    drug_rows.extend(g["rows"])
-                    drug_labels.append(g["name"])
+        if not groups:
+            r = block_end + 1
+            continue
 
-                blocks.append({
-                    "organ":       organ,
-                    "header_row":  header_row,   # None → needs insertion
-                    "ctrl_rows":   ctrl_rows,
-                    "ctrl_label":  ctrl_label,
-                    "drug_rows":   drug_rows,
-                    "drug_labels": drug_labels,
-                    "hk_name":     hk_name,
-                    "test_name":   test_name,
-                    "_block_start": r,           # used for insertion offset
-                    "_block_end":   rr - 1,
-                })
+        ctrl_rows   = groups[0]["rows"]
+        ctrl_label  = groups[0]["name"]
+        drug_rows   = []
+        drug_labels = []
+        for g in groups[1:]:
+            drug_rows.extend(g["rows"])
+            drug_labels.append(g["name"])
 
-            r = rr  # jump past the block we just parsed
-        else:
-            r += 1
+        blocks.append({
+            "organ":          organ,
+            "hk_name":        hk_name   or "HK Gene",
+            "test_name":      test_name or "Test Gene",
+            "first_data_row": block_start,
+            "last_data_row":  block_end,
+            "ctrl_rows":      ctrl_rows,
+            "ctrl_label":     ctrl_label,
+            "drug_rows":      drug_rows,
+            "drug_labels":    drug_labels,
+        })
 
-    return blocks
-
-
-# ── Header insertion ──────────────────────────────────────────────────────────
-
-def ensure_headers(ws, blocks, hk_col_name: str = "HK Gene",
-                   test_col_name: str = "Test Gene") -> list[dict]:
-    """
-    For any block whose header_row is None, insert a header row above the
-    first data row and adjust all subsequent row references accordingly.
-    Returns the (mutated) blocks list.
-    """
-    insert_count = 0   # cumulative offset from prior insertions
-
-    for blk in blocks:
-        # Shift all row refs by insertions already done above this block
-        blk["ctrl_rows"]  = [r + insert_count for r in blk["ctrl_rows"]]
-        blk["drug_rows"]  = [r + insert_count for r in blk["drug_rows"]]
-        blk["_block_start"] += insert_count
-        blk["_block_end"]   += insert_count
-
-        if blk["header_row"] is None:
-            insert_at = blk["_block_start"]
-            ws.insert_rows(insert_at)
-            # Write static header text
-            ws.cell(row=insert_at, column=COL_HK).value    = blk["hk_name"]   or hk_col_name
-            ws.cell(row=insert_at, column=COL_TEST).value  = blk["test_name"] or test_col_name
-            ws.cell(row=insert_at, column=COL_DELTA).value = "delta"
-            ws.cell(row=insert_at, column=COL_REL).value   = "Relative Expr"
-
-            blk["header_row"] = insert_at
-            blk["ctrl_rows"]  = [r + 1 for r in blk["ctrl_rows"]]
-            blk["drug_rows"]  = [r + 1 for r in blk["drug_rows"]]
-            blk["_block_end"] += 1
-            insert_count += 1
+        r = block_end + 1
 
     return blocks
 
 
-# ── Formula writer ────────────────────────────────────────────────────────────
+# ── Numerical computation ─────────────────────────────────────────────────────
 
-def write_formulas(ws, blocks) -> None:
-    """Write delta and relative-expression formulas into cols E and F."""
+def compute_values(ws, blocks) -> list:
+    """
+    Compute delta and relative expression using raw float values.
+    Augments each block dict in-place and returns the list.
+    """
     for blk in blocks:
-        h        = blk["header_row"]
         all_rows = blk["ctrl_rows"] + blk["drug_rows"]
 
-        # E: delta = test gene − housekeeping gene
-        for r in all_rows:
-            ws.cell(row=r, column=COL_DELTA).value = (
-                f"={cl(COL_TEST)}{r}-{cl(COL_HK)}{r}"
+        deltas = {}
+        for row in all_rows:
+            hk   = float(ws.cell(row=row, column=COL_HK).value)
+            test = float(ws.cell(row=row, column=COL_TEST).value)
+            deltas[row] = test - hk
+
+        ctrl_deltas   = [deltas[r] for r in blk["ctrl_rows"]]
+        avg_ctrl      = sum(ctrl_deltas) / len(ctrl_deltas)
+        rel           = {r: 2 ** (avg_ctrl - deltas[r]) for r in all_rows}
+
+        ctrl_rel = [rel[r] for r in blk["ctrl_rows"]]
+        drug_rel = [rel[r] for r in blk["drug_rows"]]
+
+        blk["deltas"]         = deltas
+        blk["avg_ctrl_delta"] = avg_ctrl
+        blk["ctrl_rel"]       = ctrl_rel
+        blk["drug_rel"]       = drug_rel
+        blk["ctrl_mean_re"]   = float(np.mean(ctrl_rel)) if ctrl_rel else 0.0
+        blk["drug_mean_re"]   = float(np.mean(drug_rel)) if drug_rel else 0.0
+
+    return blocks
+
+
+# ── Output workbook builder ───────────────────────────────────────────────────
+
+def build_output_workbook(ws_source, blocks) -> bytes:
+    """
+    Clone the source worksheet, insert a legend row at the top, reuse or
+    insert a header row per organ block, then write formulas into cols E & F.
+
+    Key design rules that avoid the off-by-one bugs:
+      1. Insert the legend row FIRST so every subsequent row number already
+         includes that +1 offset before any formula strings are written.
+      2. Check whether a text header row already exists immediately above
+         each block's first data row. If it does, reuse it; don't insert a
+         duplicate.
+      3. When inserting new header rows, process blocks bottom-to-top so
+         inserting a row for a lower block doesn't shift the row indices of
+         upper blocks that we've already accounted for.
+      4. Compute ALL final row numbers BEFORE writing any formula strings,
+         then write every formula in a single pass using those final numbers.
+    """
+
+    # ── Step 1: clone the source workbook ────────────────────────────────────
+    src_buf = io.BytesIO()
+    ws_source.parent.save(src_buf)
+    wb_out = load_workbook(io.BytesIO(src_buf.getvalue()))
+    ws_out = wb_out.active
+
+    # ── Step 2: insert legend row at row 1 (everything else shifts +1) ───────
+    ws_out.insert_rows(1)
+    ws_out["A1"] = "Legend:"
+    ws_out["B1"] = "Gray = Control   |   Red = Drug-treated"
+    ws_out["A1"].font = Font(bold=True, name="Arial", size=10)
+    ws_out["B1"].font = Font(italic=True, name="Arial", size=10)
+
+    # All original row numbers now have +1 applied.
+    # Adjust block row references to match the post-legend state.
+    for blk in blocks:
+        blk["_first"]     = blk["first_data_row"] + 1
+        blk["_last"]      = blk["last_data_row"]  + 1
+        blk["_ctrl_cur"]  = [r + 1 for r in blk["ctrl_rows"]]
+        blk["_drug_cur"]  = [r + 1 for r in blk["drug_rows"]]
+
+    # ── Step 3: decide whether each block needs a new header row ─────────────
+    # A block already has a header if the row immediately above its first data
+    # row is a non-numeric text row (i.e. the Cyclo / CD19-3 label row).
+    for blk in blocks:
+        row_above = blk["_first"] - 1
+        if row_above >= 1:
+            c_above = ws_out.cell(row=row_above, column=COL_HK).value
+            d_above = ws_out.cell(row=row_above, column=COL_TEST).value
+            has_existing = (
+                isinstance(c_above, str) and c_above.strip() != "" and
+                not is_numeric(c_above)
+            ) or (
+                isinstance(d_above, str) and d_above.strip() != "" and
+                not is_numeric(d_above)
+            )
+        else:
+            has_existing = False
+
+        blk["_has_existing_header"] = has_existing
+        blk["_needs_insert"]        = not has_existing
+
+    # ── Step 4: insert missing header rows, bottom-to-top ────────────────────
+    # Processing bottom-to-top means inserting into block N doesn't shift
+    # the "_first" row numbers of blocks 0..N-1 which we haven't touched yet.
+    sorted_desc = sorted(blocks, key=lambda b: b["_first"], reverse=True)
+    sorted_asc  = sorted(blocks, key=lambda b: b["_first"])
+
+    # Track how many rows each block needs to shift due to insertions BELOW it.
+    # Since we go bottom-to-top, when we insert for block N none of the
+    # blocks above it have been processed yet — their "_first" etc. are still
+    # correct. We just need to update blocks that sit ABOVE the insertion point
+    # after each insertion. Easiest: accumulate offset and apply at the end.
+
+    # Collect insertion points first (while row numbers are still pristine)
+    insertions = []   # list of row numbers where we will insert
+    for blk in sorted_desc:
+        if blk["_needs_insert"]:
+            insertions.append(blk["_first"])   # insert immediately before first data row
+
+    # Now actually insert, bottom-to-top (sorted_desc already is bottom-to-top)
+    cumulative = 0   # counts insertions done so far (above already-processed blocks)
+    # We process bottom-to-top, so each insertion doesn't affect the blocks
+    # above (which we haven't processed yet).  But it DOES shift the blocks
+    # below that we already processed — those are done, so no problem.
+
+    # Reset cumulative; go bottom-to-top and track shifts for blocks above.
+    # Simpler approach: do all inserts bottom-to-top and update every block
+    # above the insertion point each time.
+
+    for blk in sorted_desc:
+        if not blk["_needs_insert"]:
+            # Still need to record where its header is (the existing row above)
+            blk["_hdr_final"]  = blk["_first"] - 1
+            blk["_ctrl_final"] = blk["_ctrl_cur"][:]
+            blk["_drug_final"] = blk["_drug_cur"][:]
+            continue
+
+        insert_at = blk["_first"]   # insert a new row HERE; data shifts to insert_at+1
+
+        ws_out.insert_rows(insert_at)
+
+        # Write header labels into the new row
+        ws_out.cell(row=insert_at, column=COL_HK).value    = blk["hk_name"]
+        ws_out.cell(row=insert_at, column=COL_TEST).value  = blk["test_name"]
+        ws_out.cell(row=insert_at, column=COL_DELTA).value = "delta"
+        ws_out.cell(row=insert_at, column=COL_REL).value   = "Avg Ctrl Δ / Rel Expr"
+
+        # This block's header and data rows after the insertion
+        blk["_hdr_final"]  = insert_at
+        blk["_ctrl_final"] = [r + 1 for r in blk["_ctrl_cur"]]
+        blk["_drug_final"] = [r + 1 for r in blk["_drug_cur"]]
+
+        # Update all blocks that sit ABOVE this insertion point (i.e. smaller
+        # _first value) — they haven't been processed yet in this loop so their
+        # _ctrl_cur / _drug_cur / _first still need shifting.
+        for other in blocks:
+            if other is blk:
+                continue
+            if other["_first"] < insert_at:
+                # Block sits above the insertion — not affected
+                pass
+            # Block sits below or at insertion — already processed (done), skip
+            # Block sits at same point — shouldn't happen
+
+        # Also update blocks that are ABOVE (first < insert_at) in the sorted_asc
+        # list that we haven't processed yet (they are earlier in sorted_desc
+        # so they come later in sorted_desc iteration — haven't been touched).
+        # Because we go bottom-to-top, blocks above have SMALLER _first values,
+        # so they are NOT shifted by an insertion at insert_at. Correct: inserting
+        # at row 5 doesn't change rows 1-4. ✓
+
+    # For blocks that had existing headers (no insert), set their finals now
+    # (after all insertions are done, so we know the true final positions).
+    # We need to figure out how many insertions happened ABOVE each such block.
+    # Recalculate by scanning sorted_asc and tracking cumulative inserted rows.
+
+    cumulative_above = {}
+    running = 0
+    # sorted_asc is in ascending order of original _first
+    # We inserted for blocks in sorted_desc order.
+    # Count how many insertions happened at rows BELOW each block.
+    all_insert_rows = [b["_first"] for b in blocks if b["_needs_insert"]]
+
+    for blk in sorted_asc:
+        # How many insertions are at rows < blk["_first"]?
+        # (inserting at a row >= blk["_first"] shifts blk upward)
+        shifts = sum(1 for ins_row in all_insert_rows if ins_row <= blk["_first"])
+        # But for blocks that needed insert, _hdr_final / _ctrl_final are already set
+        if not blk["_needs_insert"]:
+            # existing header row was at _first - 1; now shifted by `shifts`
+            blk["_hdr_final"]  = blk["_first"] - 1 + shifts
+            blk["_ctrl_final"] = [r + shifts for r in blk["_ctrl_cur"]]
+            blk["_drug_final"] = [r + shifts for r in blk["_drug_cur"]]
+
+    # ── Step 5: write all formulas using the final, correct row numbers ───────
+    for blk in sorted_asc:
+        h       = blk["_hdr_final"]
+        all_out = blk["_ctrl_final"] + blk["_drug_final"]
+
+        # Delta: E{row} = D{row} - C{row}
+        for row in all_out:
+            ws_out.cell(row=row, column=COL_DELTA).value = (
+                f"={cl(COL_TEST)}{row}-{cl(COL_HK)}{row}"
             )
 
-        # F header row: average of control deltas
-        ctrl_refs = ",".join(f"{cl(COL_DELTA)}{r}" for r in blk["ctrl_rows"])
-        ws.cell(row=h, column=COL_REL).value = f"=AVERAGE({ctrl_refs})"
+        # Average control delta in header row col F
+        ctrl_refs = ",".join(f"{cl(COL_DELTA)}{r}" for r in blk["_ctrl_final"])
+        ws_out.cell(row=h, column=COL_REL).value = f"=AVERAGE({ctrl_refs})"
 
-        # F data rows: 2^(avg_ctrl_delta − delta)
-        for r in all_rows:
-            ws.cell(row=r, column=COL_REL).value = (
-                f"=2^({cl(COL_REL)}{h}-{cl(COL_DELTA)}{r})"
+        # Relative expression: F{row} = 2^(F{h} - E{row})
+        for row in all_out:
+            ws_out.cell(row=row, column=COL_REL).value = (
+                f"=2^({cl(COL_REL)}{h}-{cl(COL_DELTA)}{row})"
             )
+
+    # ── Step 6: style ─────────────────────────────────────────────────────────
+    _style_output(ws_out, sorted_asc)
+
+    out_buf = io.BytesIO()
+    wb_out.save(out_buf)
+    return out_buf.getvalue()
 
 
 # ── Styling ───────────────────────────────────────────────────────────────────
 
-def _fill(hex_color: str) -> PatternFill:
+def _fill(hex_color):
     return PatternFill("solid", start_color=hex_color, end_color=hex_color)
 
-def _border() -> Border:
+def _border():
     t = Side(style="thin", color="CCCCCC")
     return Border(left=t, right=t, top=t, bottom=t)
 
-CENTER = Alignment(horizontal="center", vertical="center")
+_CENTER = Alignment(horizontal="center", vertical="center")
 
-def style_workbook(ws, blocks) -> None:
-    """Apply formatting to header and data rows of every block."""
+def _style_output(ws, blocks):
+    """Style header and data rows. Uses _hdr_final / _ctrl_final / _drug_final
+    which already incorporate the legend row offset and any inserted header rows."""
     ws.column_dimensions[cl(COL_ORGAN)].width = 10
-    ws.column_dimensions[cl(COL_LABEL)].width = 20
+    ws.column_dimensions[cl(COL_LABEL)].width = 22
     ws.column_dimensions[cl(COL_HK)].width    = 14
     ws.column_dimensions[cl(COL_TEST)].width   = 14
     ws.column_dimensions[cl(COL_DELTA)].width  = 12
-    ws.column_dimensions[cl(COL_REL)].width    = 18
+    ws.column_dimensions[cl(COL_REL)].width    = 22
 
     hdr_fill  = _fill(HDR_HEX)
     ctrl_fill = _fill(CTRL_HEX)
@@ -267,103 +411,42 @@ def style_workbook(ws, blocks) -> None:
     std_font  = Font(name="Arial", size=10)
 
     for blk in blocks:
-        h = blk["header_row"]
+        h         = blk["_hdr_final"]
+        ctrl_rows = blk["_ctrl_final"]
+        drug_rows = blk["_drug_final"]
 
-        # Header row
         for col in range(1, COL_REL + 1):
             cell = ws.cell(row=h, column=col)
-            cell.font      = hdr_font
-            cell.fill      = hdr_fill
-            cell.alignment = CENTER
-            cell.border    = border
+            cell.font = hdr_font; cell.fill = hdr_fill
+            cell.alignment = _CENTER; cell.border = border
 
-        # Control rows (gray)
-        for r in blk["ctrl_rows"]:
+        for row in ctrl_rows:
             for col in range(1, COL_REL + 1):
-                cell = ws.cell(row=r, column=col)
-                cell.font      = std_font
-                cell.fill      = ctrl_fill
-                cell.alignment = CENTER
-                cell.border    = border
+                cell = ws.cell(row=row, column=col)
+                cell.font = std_font; cell.fill = ctrl_fill
+                cell.alignment = _CENTER; cell.border = border
 
-        # Drug rows (red)
-        for r in blk["drug_rows"]:
+        for row in drug_rows:
             for col in range(1, COL_REL + 1):
-                cell = ws.cell(row=r, column=col)
-                cell.font      = std_font
-                cell.fill      = drug_fill
-                cell.alignment = CENTER
-                cell.border    = border
-
-
-def add_legend_row(ws, blocks) -> list[dict]:
-    """
-    Prepend a single legend row at the very top of the sheet and shift
-    all block row refs down by 1.
-    """
-    ws.insert_rows(1)
-    ws["A1"] = "Legend:"
-    ws["B1"] = "Gray = Control   |   Red = Drug-treated"
-    ws["A1"].font = Font(bold=True, name="Arial", size=10)
-    ws["B1"].font = Font(italic=True, name="Arial", size=10)
-
-    for blk in blocks:
-        blk["header_row"] += 1
-        blk["ctrl_rows"]   = [r + 1 for r in blk["ctrl_rows"]]
-        blk["drug_rows"]   = [r + 1 for r in blk["drug_rows"]]
-
-    return blocks
-
-
-# ── Chart data extractor ──────────────────────────────────────────────────────
-
-def extract_chart_data(ws_data_only, blocks) -> list[dict]:
-    """
-    Read back calculated values from the recalculated workbook and return
-    per-organ means for chart plotting.
-    """
-    results = []
-    for blk in blocks:
-        def _mean(rows):
-            vals = []
-            for r in rows:
-                v = ws_data_only.cell(row=r, column=COL_REL).value
-                if v is not None:
-                    try:
-                        vals.append(float(v))
-                    except (TypeError, ValueError):
-                        pass
-            return float(np.mean(vals)) if vals else 0.0
-
-        results.append({
-            "organ":       blk["organ"],
-            "ctrl_mean":   _mean(blk["ctrl_rows"]),
-            "drug_mean":   _mean(blk["drug_rows"]),
-            "ctrl_label":  blk["ctrl_label"],
-            "drug_labels": blk["drug_labels"],
-        })
-    return results
+                cell = ws.cell(row=row, column=col)
+                cell.font = std_font; cell.fill = drug_fill
+                cell.alignment = _CENTER; cell.border = border
 
 
 # ── Chart renderer ────────────────────────────────────────────────────────────
 
-def render_chart(chart_data: list[dict]) -> bytes:
-    """
-    Render the grouped bar chart and return raw PNG bytes (for Streamlit
-    download or st.image display).
-    """
-    organs     = [d["organ"]     for d in chart_data]
-    ctrl_means = [d["ctrl_mean"] for d in chart_data]
-    drug_means = [d["drug_mean"] for d in chart_data]
+def render_chart(blocks: list) -> bytes:
+    organs     = [b["organ"]        for b in blocks]
+    ctrl_means = [b["ctrl_mean_re"] for b in blocks]
+    drug_means = [b["drug_mean_re"] for b in blocks]
     n          = len(organs)
 
-    ctrl_label = chart_data[0]["ctrl_label"] if chart_data else "Control"
-    drug_label = ", ".join(chart_data[0]["drug_labels"]) if chart_data else "Treatment"
+    ctrl_label = blocks[0]["ctrl_label"]             if blocks else "Control"
+    drug_label = ", ".join(blocks[0]["drug_labels"]) if blocks else "Treatment"
 
     group_spacing = 1.4
     bar_width     = 0.22
-    bar_gap       = 0.10
-    half_span     = bar_width / 2 + bar_gap / 2
+    half_span     = bar_width / 2 + 0.05
     x             = np.arange(n) * group_spacing
 
     fig, ax = plt.subplots(figsize=(max(5, 2.4 * n + 1.8), 5.5))
@@ -377,7 +460,6 @@ def render_chart(chart_data: list[dict]) -> bytes:
     ax.set_xticklabels(organs, fontsize=13)
     ax.set_ylabel("Relative Expression", fontsize=12)
     ax.set_ylim(bottom=0)
-
     ax.yaxis.grid(True, color="#E8E8E8", linewidth=0.8, zorder=0)
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
@@ -385,26 +467,16 @@ def render_chart(chart_data: list[dict]) -> bytes:
     ax.spines["left"].set_color("#AAAAAA")
     ax.spines["bottom"].set_color("#AAAAAA")
     ax.tick_params(axis="both", which="both", length=0, labelsize=11)
-    ax.set_xlim(
-        -group_spacing * 0.55,
-        (n - 1) * group_spacing + group_spacing * 0.55
-    )
+    ax.set_xlim(-group_spacing * 0.55,
+                (n - 1) * group_spacing + group_spacing * 0.55)
 
     ctrl_patch = mpatches.Patch(color=CTRL_MPL, label=ctrl_label)
     drug_patch = mpatches.Patch(color=DRUG_MPL, label=drug_label)
-    ax.legend(
-        handles=[ctrl_patch, drug_patch],
-        loc="upper center",
-        bbox_to_anchor=(0.5, 1.13),
-        ncol=2,
-        frameon=False,
-        fontsize=11,
-        handlelength=1.0,
-        handleheight=1.0,
-    )
+    ax.legend(handles=[ctrl_patch, drug_patch], loc="upper center",
+              bbox_to_anchor=(0.5, 1.13), ncol=2, frameon=False,
+              fontsize=11, handlelength=1.0, handleheight=1.0)
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-
     buf = io.BytesIO()
     plt.savefig(buf, format="png", dpi=180, bbox_inches="tight",
                 facecolor="white", edgecolor="none")
@@ -413,25 +485,14 @@ def render_chart(chart_data: list[dict]) -> bytes:
     return buf.read()
 
 
-# ── Top-level pipeline (called by Streamlit app) ──────────────────────────────
+# ── Top-level pipeline ────────────────────────────────────────────────────────
 
 def run_pipeline(file_bytes: bytes) -> dict:
-    """
-    Accept raw .xlsx bytes, run the full analysis, and return:
-    {
-        "xlsx_bytes"  : bytes   — completed workbook
-        "chart_bytes" : bytes   — PNG chart
-        "chart_data"  : list    — per-organ means (for optional table display)
-        "blocks"      : list    — parsed block metadata
-        "errors"      : str     — non-empty if something went wrong
+    result = {
+        "xlsx_bytes": None, "chart_bytes": None,
+        "chart_data": [],   "blocks": [],   "errors": "",
     }
-    """
-    import subprocess, json, tempfile, os, shutil
 
-    result = {"xlsx_bytes": None, "chart_bytes": None,
-              "chart_data": [], "blocks": [], "errors": ""}
-
-    # --- 1. Load ---
     try:
         wb = load_workbook(io.BytesIO(file_bytes))
         ws = wb.active
@@ -439,70 +500,42 @@ def run_pipeline(file_bytes: bytes) -> dict:
         result["errors"] = f"Could not open file: {e}"
         return result
 
-    # --- 2. Parse ---
     blocks = parse_blocks(ws)
     if not blocks:
         result["errors"] = (
-            "No data blocks detected. Make sure columns A–D are filled in "
-            "and each organ group is separated by a blank row."
+            "No data blocks detected. Make sure columns C and D contain "
+            "numeric values and each organ group is separated by a blank row."
         )
         return result
+
+    try:
+        blocks = compute_values(ws, blocks)
+    except Exception as e:
+        result["errors"] = f"Calculation error: {e}"
+        return result
+
     result["blocks"] = blocks
+    result["chart_data"] = [
+        {
+            "organ":       b["organ"],
+            "ctrl_mean":   b["ctrl_mean_re"],
+            "drug_mean":   b["drug_mean_re"],
+            "ctrl_label":  b["ctrl_label"],
+            "drug_labels": b["drug_labels"],
+        }
+        for b in blocks
+    ]
 
-    # --- 3. Ensure header rows exist (insert if needed) ---
-    blocks = ensure_headers(ws, blocks)
-
-    # --- 4. Write formulas ---
-    write_formulas(ws, blocks)
-
-    # --- 5. Style ---
-    style_workbook(ws, blocks)
-
-    # --- 6. Add legend row at top ---
-    blocks = add_legend_row(ws, blocks)
-
-    # Re-write formulas after row shifts from legend insertion
-    write_formulas(ws, blocks)
-
-    # --- 7. Save to temp file for recalculation ---
-    tmp_dir = tempfile.mkdtemp()
-    tmp_path = os.path.join(tmp_dir, "output.xlsx")
     try:
-        wb.save(tmp_path)
+        result["xlsx_bytes"] = build_output_workbook(ws, blocks)
+    except Exception as e:
+        result["errors"] = f"Excel output error: {e}"
+        return result
 
-        # --- 8. Recalculate with LibreOffice ---
-        recalc = subprocess.run(
-            ["python3", "/mnt/skills/public/xlsx/scripts/recalc.py", tmp_path],
-            capture_output=True, text=True, timeout=60
-        )
-        try:
-            info = json.loads(recalc.stdout)
-            if info.get("status") == "errors_found":
-                result["errors"] = (
-                    f"Formula errors after calculation: {info.get('error_summary')}"
-                )
-                return result
-        except Exception:
-            # recalc script not available (e.g. local dev) — continue with unrecalculated
-            pass
-
-        # --- 9. Read back calculated values ---
-        wb2 = load_workbook(tmp_path, data_only=True)
-        ws2 = wb2.active
-        chart_data = extract_chart_data(ws2, blocks)
-        result["chart_data"] = chart_data
-
-        # --- 10. Read final xlsx bytes ---
-        with open(tmp_path, "rb") as f:
-            result["xlsx_bytes"] = f.read()
-
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    # --- 11. Render chart ---
     try:
-        result["chart_bytes"] = render_chart(chart_data)
+        result["chart_bytes"] = render_chart(blocks)
     except Exception as e:
         result["errors"] = f"Chart rendering failed: {e}"
+        return result
 
     return result
